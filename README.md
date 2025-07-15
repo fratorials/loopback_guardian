@@ -1,6 +1,6 @@
 # Loopback Guardian: Rilevamento delle Intrusioni su Localhost tramite IA
 
-![Python](https://img.shields.io/badge/python-3.9%2B-blue)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![TensorFlow](https://img.shields.io/badge/TensorFlow-2.x-orange)
 ![Scapy](https://img.shields.io/badge/scapy-2.4-yellow)
 ![Pandas](https://img.shields.io/badge/pandas-1.x-brightgreen)
