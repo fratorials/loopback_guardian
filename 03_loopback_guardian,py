@@ -1,0 +1,204 @@
+# 03_loopback_guardian.py
+
+# Importazione delle librerie 
+
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module='sklearn')
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+import time
+import numpy as np #type: ignore
+import pandas as pd #type: ignore
+from scapy.all import sniff, IP, TCP, UDP #type: ignore
+from collections import defaultdict
+import pickle
+from tensorflow.keras.models import load_model #type: ignore
+import argparse
+import threading
+from colorama import init, Fore, Style #type: ignore
+
+# Inizializza colorama per l'output colorato su Windows
+init(autoreset=True)
+
+# --- Configurazione (deve essere identica a quella del generatore di dataset) ---
+LOOPBACK_IFACE = 'lo'
+FLOW_TIMEOUT = 15.0
+
+# Copiamo le funzioni di gestione dei flussi dallo script 01.
+# In un progetto più grande, queste sarebbero in un file di utility condiviso.
+active_flows = defaultdict(list)
+stop_sniffing = threading.Event()
+
+def get_flow_key(packet):
+    if IP in packet and (TCP in packet or UDP in packet):
+        proto = packet[IP].proto
+        return (packet[IP].src, packet.sport, packet[IP].dst, packet.dport, proto)
+    return None
+
+def calculate_flow_features(flow_packets):
+    if not flow_packets: return None
+    flow_packets.sort(key=lambda x: x[1])
+    first_packet, start_time = flow_packets[0]
+    last_packet, end_time = flow_packets[-1]
+    flow_key = get_flow_key(first_packet)
+    flow_duration = (end_time - start_time) * 1_000_000
+    fwd_packets = [p for p, ts in flow_packets if get_flow_key(p) == flow_key]
+    bwd_packets = [p for p, ts in flow_packets if get_flow_key(p) != flow_key]
+    fwd_timestamps = [ts for p, ts in flow_packets if get_flow_key(p) == flow_key]
+    bwd_timestamps = [ts for p, ts in flow_packets if get_flow_key(p) != flow_key]
+    fwd_iat = np.diff(fwd_timestamps) if len(fwd_timestamps) > 1 else []
+    bwd_iat = np.diff(bwd_timestamps) if len(bwd_timestamps) > 1 else []
+    features = {
+        'protocol': flow_key[4], 
+        'src_port': flow_key[1], 
+        'dst_port': flow_key[3],
+        'fwd_pkt_count': len(fwd_packets), 'bwd_pkt_count': len(bwd_packets), 'total_pkt_count': len(flow_packets),
+        'fwd_bytes_sum': sum(len(p) for p in fwd_packets), 'bwd_bytes_sum': sum(len(p) for p in bwd_packets),
+        'total_bytes_sum': sum(len(p) for p, ts in flow_packets),
+        'flow_duration': flow_duration,
+        'fwd_iat_mean': np.mean(fwd_iat) * 1_000_000 if len(fwd_iat) > 0 else 0,
+        'fwd_iat_std': np.std(fwd_iat) * 1_000_000 if len(fwd_iat) > 0 else 0,
+        'bwd_iat_mean': np.mean(bwd_iat) * 1_000_000 if len(bwd_iat) > 0 else 0,
+        'bwd_iat_std': np.std(bwd_iat) * 1_000_000 if len(bwd_iat) > 0 else 0,
+        'fwd_pkt_len_mean': np.mean([len(p) for p in fwd_packets]) if fwd_packets else 0,
+        'bwd_pkt_len_mean': np.mean([len(p) for p in bwd_packets]) if bwd_packets else 0,
+        'pkt_len_max': max(len(p) for p, ts in flow_packets) if flow_packets else 0,
+        'pkt_len_min': min(len(p) for p, ts in flow_packets) if flow_packets else 0,
+    }
+    return features
+
+class AnomalyDetector:
+    def __init__(self, model, scaler, threshold, feature_names):
+        self.model = model
+        self.scaler = scaler
+        self.threshold = threshold
+        self.feature_names = feature_names
+
+    def inspect(self, flow_features):
+        """Ispeziona un singolo flusso e decide se è un'anomalia."""
+        if flow_features is None:
+            return
+
+        # Prepara i dati per il modello, assicurando l'ordine corretto delle feature
+        df = pd.DataFrame([flow_features])
+        for col in self.feature_names:
+            if col not in df.columns:
+                df[col] = 0
+        df = df[self.feature_names]
+        
+        # Applica lo stesso scaling usato in training
+        scaled_features = self.scaler.transform(df.values)
+
+        # Il modello predice (ricostruisce) le feature
+        reconstructed = self.model.predict(scaled_features, verbose=0)
+        
+        # Calcola l'errore di ricostruzione
+        reconstruction_error = np.mean(np.abs(scaled_features - reconstructed), axis=1)[0]
+        
+        # Determina il nome del protocollo (6=TCP, 17=UDP)
+        protocol_name = 'TCP' if flow_features['protocol'] == 6 else 'UDP'
+        flow_info = f"Flusso {protocol_name} {flow_features['src_port']} -> {flow_features['dst_port']}"
+        
+        # Confronta con la soglia
+        if reconstruction_error > self.threshold:
+            print(f"{Fore.RED}{Style.BRIGHT}[ALARM]  {flow_info}. Errore: {reconstruction_error:.6f}. (Soglia: {self.threshold:.6f})")
+            print(f"{Fore.YELLOW}         |> Dettagli: {flow_features['total_pkt_count']} pacchetti, {flow_features['total_bytes_sum']} bytes, durata {flow_features['flow_duration']/1e6:.2f}s")
+        else:
+            print(f"{Fore.GREEN}[OK]     {flow_info}. Errore: {reconstruction_error:.6f}.")
+
+detector = None
+
+def process_packet(packet):
+    flow_key = get_flow_key(packet)
+    if flow_key:
+        active_flows[flow_key].append((packet, time.time()))
+
+def check_timed_out_flows():
+    global detector
+    current_time = time.time()
+    timed_out_keys = [key for key, packets in active_flows.items() if current_time - packets[-1][1] > FLOW_TIMEOUT]
+    
+    for key in timed_out_keys:
+        flow_data = active_flows.pop(key)
+        features = calculate_flow_features(flow_data)
+        if detector and features:
+            detector.inspect(features)
+
+def main(model_path, scaler_path, training_data_path):
+    global detector
+    print("--- Loopback Guardian: Rilevamento Anomalie in Tempo Reale ---")
+
+    # 1. Carica modello e scaler
+    try:
+        model = load_model(model_path)
+        with open(scaler_path, 'rb') as f:
+            scaler = pickle.load(f)
+
+        # Definiamo esplicitamente le feature attese dal modello per robustezza
+        expected_features = [
+            'protocol', 'src_port', 'dst_port', 'fwd_pkt_count', 'bwd_pkt_count',
+            'total_pkt_count', 'fwd_bytes_sum', 'bwd_bytes_sum', 'total_bytes_sum',
+            'flow_duration', 'fwd_iat_mean', 'fwd_iat_std', 'bwd_iat_mean',
+            'bwd_iat_std', 'fwd_pkt_len_mean', 'bwd_pkt_len_mean', 'pkt_len_max', 'pkt_len_min'
+        ]
+        
+        training_df = pd.read_csv(training_data_path)
+        training_df.dropna(inplace=True)
+
+        # Aggiungi colonne mancanti con valore di default 0
+        for col in expected_features:
+            if col not in training_df.columns:
+                training_df[col] = 0
+        
+        # Assicura che le colonne siano nell'ordine corretto
+        training_df = training_df[expected_features]
+        feature_names = expected_features
+
+    except FileNotFoundError as e:
+        print(f"[ERROR] Impossibile caricare i file necessari: {e}. Esegui prima gli script 01 e 02.")
+        return
+
+    print("[*] Modello e scaler caricati correttamente.")
+
+    # 2. Calcola la soglia di anomalia
+    print("[*] Calcolo della soglia di anomalia basata sui dati di training...")
+    X_train_scaled = scaler.transform(training_df.values)
+    train_reconstructed = model.predict(X_train_scaled, verbose=0)
+    train_mae = np.mean(np.abs(X_train_scaled - train_reconstructed), axis=1)
+    
+    # La soglia è definita come media + 3 deviazioni standard dell'errore.
+    # Questo è un approccio statistico comune per definire "cosa è insolito".
+    threshold = np.quantile(train_mae, 0.999) # Soglia impostata al 99.9° percentile dell'errore di ricostruzione sui dati di training
+    
+    print(f"[*] Soglia di anomalia impostata a: {threshold:.6f}")
+    
+    detector = AnomalyDetector(model, scaler, threshold, feature_names)
+
+    # 3. Avvia lo sniffing in tempo reale
+    print(f"{Style.BRIGHT}[*] Avvio monitoraggio su interfaccia di loopback. Premi Ctrl+C per fermare.")
+    
+    sniffer_thread = threading.Thread(
+        target=sniff,
+        kwargs={'iface': LOOPBACK_IFACE, 'prn': process_packet, 'store': False, 'stop_filter': lambda p: stop_sniffing.is_set()}
+    )
+    sniffer_thread.start()
+
+    try:
+        while True:
+            check_timed_out_flows()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[*] Rilevato Ctrl+C. Chiusura in corso...")
+        stop_sniffing.set()
+        sniffer_thread.join()
+        print("[*] Monitoraggio terminato.")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Rileva anomalie sul traffico di loopback in tempo reale.")
+    parser.add_argument('--model', type=str, default="autoencoder_model.keras", help="Percorso del modello addestrato.")
+    parser.add_argument('--scaler', type=str, default="data_scaler.pkl", help="Percorso dello scaler dei dati.")
+    parser.add_argument('--data', type=str, default="benign_flows.csv", help="Percorso dei dati di training per calcolare la soglia.")
+    args = parser.parse_args()
+    
+    main(args.model, args.scaler, args.data)
